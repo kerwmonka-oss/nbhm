@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Watch movies and TV shows on Velora." />
+  <title>Now Playing — Velora</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>" />
+</head>
+<body data-page="player" class="page-enter player-page">
+
+  <!-- ═══════ Player Topbar ═══════ -->
+  <header class="player-topbar" id="playerTopbar">
+    <a href="javascript:void(0)" class="player-topbar__back" id="playerBack" title="Go back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+      </svg>
+      <span>Back</span>
+    </a>
+    <div class="player-topbar__title" id="playerTitle">Loading…</div>
+    <div class="player-topbar__spacer"></div>
+  </header>
+
+  <!-- ═══════ Player Container ═══════ -->
+  <div class="player-container" id="playerContainer">
+    <!-- Loading state -->
+    <div class="player-loading" id="playerLoading">
+      <div class="player-loading__spinner"></div>
+      <p>Loading player…</p>
+    </div>
+
+    <!-- Iframe injected here by JS -->
+    <div class="player-iframe-wrapper" id="playerWrapper" style="display:none;">
+      <iframe
+        id="playerIframe"
+        src=""
+        frameborder="0"
+        allowfullscreen
+        allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+        scrolling="no"
+      ></iframe>
+    </div>
+  </div>
+
+  <!-- ═══════ TV Controls (Season/Episode) ═══════ -->
+  <div class="player-tv-controls" id="tvControls" style="display:none;">
+    <div class="player-tv-controls__inner">
+      <div class="player-tv-controls__group">
+        <label class="player-tv-controls__label" for="seasonSelect">Season</label>
+        <select class="player-tv-controls__select" id="seasonSelect"></select>
+      </div>
+      <div class="player-tv-controls__group">
+        <label class="player-tv-controls__label" for="episodeSelect">Episode</label>
+        <select class="player-tv-controls__select" id="episodeSelect"></select>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════ Player Info ═══════ -->
+  <div class="player-info" id="playerInfo" style="display:none;">
+    <h2 class="player-info__title" id="infoTitle"></h2>
+    <p class="player-info__overview" id="infoOverview"></p>
+  </div>
+
+  <script src="auth.js"></script>
+  <script src="shield.js"></script>
+  <script src="app.js"></script>
+  <script src="cleaner.js"></script>
+</body>
+</html>
