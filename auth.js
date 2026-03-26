@@ -148,7 +148,7 @@
       return {
         ok: false,
         error: 'device_conflict',
-        message: 'This account is already in use on another device. Please logout from the first device.',
+        message: 'This account is already in use on another device. Please log out first.',
       };
     }
 
@@ -312,11 +312,10 @@
       localStorage.removeItem(SESSION_STATUS_KEY);
       localStorage.removeItem(SESSION_EMAIL_KEY);
       localStorage.removeItem(REMEMBER_KEY);
+      localStorage.removeItem(SESSION_ID_KEY);
       sessionStorage.removeItem(SESSION_STATUS_KEY);
       sessionStorage.removeItem(SESSION_EMAIL_KEY);
-      // NOTE: SESSION_ID_KEY is NOT removed on logout.
-      // It stays permanently so the same device always has the same ID.
-      // This ensures multiple tabs share the same session_id.
+      // session_id is removed on logout so a fresh one is generated on next login
     }
   };
 
