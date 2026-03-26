@@ -1,6 +1,6 @@
 /* ============================================
    Velora Auth — Supabase Login Gate
-   Single-device enforcement per user.
+   Strict single-device enforcement per user.
    Include BEFORE app.js in every HTML page.
    ============================================ */
 (function () {
@@ -19,25 +19,25 @@
   const SESSION_STATUS_KEY = 'velora_auth_status';
   const SESSION_EMAIL_KEY = 'velora_auth_email';
   const REMEMBER_KEY = 'velora_auth_remember';
-  const DEVICE_ID_KEY = 'velora_device_id';       // unique per browser, never changes
-  const SESSION_ID_KEY = 'velora_session_id';      // set on login, validated against DB
+  const SESSION_ID_KEY = 'velora_session_id';      // persisted in localStorage for cross-tab sharing
 
   // ──────────────────────────────────────────────
-  // Device ID — unique per browser installation
-  // Persists in localStorage forever (not session-based)
+  // Session ID — unique per device
+  // Persists in localStorage so ALL tabs/windows on
+  // the same device share the exact same session_id.
   // ──────────────────────────────────────────────
-  function getDeviceId() {
-    let id = localStorage.getItem(DEVICE_ID_KEY);
+  function getOrCreateSessionId() {
+    let id = localStorage.getItem(SESSION_ID_KEY);
     if (!id) {
-      // Generate a cryptographically unique ID
-      id = (crypto.randomUUID ? crypto.randomUUID() : generateFallbackUUID());
-      localStorage.setItem(DEVICE_ID_KEY, id);
-      console.log('[Auth] New device ID generated:', id);
+      id = generateSessionId();
+      localStorage.setItem(SESSION_ID_KEY, id);
+      console.log('[Auth] New session_id generated:', id);
     }
     return id;
   }
 
-  function generateFallbackUUID() {
+  function generateSessionId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
     // Fallback for browsers without crypto.randomUUID
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
       const r = (Math.random() * 16) | 0;
@@ -51,6 +51,7 @@
   // ──────────────────────────────────────────────
   const AUTH_TIMEOUT = 10000;
   const AUTH_RETRY_DELAY = 1000;
+  const SESSION_CHECK_INTERVAL = 30000; // validate session every 30 seconds
 
   // ──────────────────────────────────────────────
   // Supabase Helpers — GET and PATCH with retry
@@ -110,19 +111,19 @@
   }
 
   // ──────────────────────────────────────────────
-  // Core Auth Logic — Single-Device Enforcement
+  // Core Auth Logic — Strict Single-Device Enforcement
   // ──────────────────────────────────────────────
 
   /**
    * Attempt login:
-   * 1. Check if email exists
+   * 1. Check if email exists in the users table
    * 2. Check session_id in DB:
-   *    - null → claim the session (PATCH device ID into DB)
-   *    - matches this device → allow (same device re-login)
-   *    - different → deny (another device is active)
+   *    - null → allow login, claim session
+   *    - matches this device's session_id → allow (same device re-login)
+   *    - different → DENY (another device is active)
    */
   async function attemptLogin(email) {
-    const deviceId = getDeviceId();
+    const sessionId = getOrCreateSessionId();
 
     // Step 1: Fetch user row including session_id
     const url = `${SUPABASE_URL}/rest/v1/${AUTH_TABLE}?email=eq.${encodeURIComponent(email)}&select=email,session_id`;
@@ -135,27 +136,27 @@
     }
 
     const user = result.data[0];
-    const currentSessionId = user.session_id;
+    const dbSessionId = user.session_id;
 
-    console.log(`[Auth] DB session_id: ${currentSessionId || '(empty)'}`);
-    console.log(`[Auth] This device_id: ${deviceId}`);
+    console.log(`[Auth] DB session_id: ${dbSessionId || '(null)'}`);
+    console.log(`[Auth] This device session_id: ${sessionId}`);
 
-    // Step 2: Check single-device constraint
-    if (currentSessionId && currentSessionId !== deviceId) {
-      // Another device is active
-      console.warn('[Auth] Login denied — another device is active');
+    // Step 2: Strict single-device constraint
+    if (dbSessionId && dbSessionId !== sessionId) {
+      // ❌ Another device is active — DENY access
+      console.warn('[Auth] Login DENIED — another device has an active session');
       return {
         ok: false,
         error: 'device_conflict',
-        message: 'Your account is already active on another device. Please logout first.',
+        message: 'This account is already in use on another device. Please logout from the first device.',
       };
     }
 
-    // Step 3: Claim the session — write this device's ID into the DB
+    // Step 3: session_id is NULL or matches → claim/re-claim the session
     const patchUrl = `${SUPABASE_URL}/rest/v1/${AUTH_TABLE}?email=eq.${encodeURIComponent(email)}`;
     const patchResult = await supabaseRequest(patchUrl, {
       method: 'PATCH',
-      body: JSON.stringify({ session_id: deviceId }),
+      body: JSON.stringify({ session_id: sessionId }),
     });
 
     if (!patchResult.ok) {
@@ -168,8 +169,8 @@
   }
 
   /**
-   * Clear session_id in Supabase (on logout)
-   * Sets session_id to null so another device can login.
+   * Release session_id in Supabase (on logout).
+   * Sets session_id to NULL so another device can login.
    */
   async function releaseSession(email) {
     if (!email) return;
@@ -178,22 +179,27 @@
     const result = await supabaseRequest(url, {
       method: 'PATCH',
       body: JSON.stringify({ session_id: null }),
-    }, 1); // single attempt for logout — don't block the user
+    }, 1); // single attempt — don't block the user
 
     if (result.ok) {
-      console.log('[Auth] Session released in DB');
+      console.log('[Auth] Session released in DB (session_id set to NULL)');
     } else {
       console.warn('[Auth] Could not release session in DB (non-blocking)');
     }
   }
 
   /**
-   * Validate that this device still owns the session.
-   * Called on every page load for logged-in users.
-   * If the DB session_id no longer matches → force logout.
+   * Validate that this device still owns the active session.
+   * Called on page load AND periodically while user is on the page.
+   *
+   * Rules:
+   * - DB session_id matches this device → VALID
+   * - DB session_id is NULL → session was cleared (admin/logout), reclaim it
+   * - DB session_id is different → INVALID (another device logged in)
+   * - Network error → allow offline access (don't force logout)
    */
   async function validateSession(email) {
-    const deviceId = getDeviceId();
+    const sessionId = getOrCreateSessionId();
     const url = `${SUPABASE_URL}/rest/v1/${AUTH_TABLE}?email=eq.${encodeURIComponent(email)}&select=session_id`;
     const result = await supabaseRequest(url, { method: 'GET' }, 1);
 
@@ -211,29 +217,66 @@
 
     const dbSessionId = result.data[0].session_id;
 
-    if (dbSessionId === deviceId) {
-      console.log('[Auth] Session valid — device matches');
+    if (dbSessionId === sessionId) {
+      console.log('[Auth] Session valid — session_id matches');
       return true;
     }
 
     if (!dbSessionId) {
-      // Session was cleared (e.g., admin cleared it) — reclaim
+      // Session was cleared (e.g., admin cleared it) — reclaim it
       console.log('[Auth] Session was cleared. Reclaiming...');
       const patchUrl = `${SUPABASE_URL}/rest/v1/${AUTH_TABLE}?email=eq.${encodeURIComponent(email)}`;
       await supabaseRequest(patchUrl, {
         method: 'PATCH',
-        body: JSON.stringify({ session_id: deviceId }),
+        body: JSON.stringify({ session_id: sessionId }),
       }, 1);
       return true;
     }
 
-    // Another device took over
-    console.warn('[Auth] Session invalidated — another device is active');
+    // Another device took over — session is invalid
+    console.warn('[Auth] Session INVALIDATED — another device took over');
     return false;
   }
 
   // ──────────────────────────────────────────────
-  // Session Management (local)
+  // Periodic Session Validation
+  // Checks every 30s that this device still owns the session.
+  // If another device logged in, force-logout immediately.
+  // ──────────────────────────────────────────────
+  let sessionCheckTimer = null;
+
+  function startSessionMonitor() {
+    stopSessionMonitor(); // clear any existing timer
+
+    sessionCheckTimer = setInterval(async () => {
+      const email = Session.getEmail();
+      if (!email || !Session.isLoggedIn()) {
+        stopSessionMonitor();
+        return;
+      }
+
+      console.log('[Auth] Periodic session check...');
+      const valid = await validateSession(email);
+
+      if (!valid) {
+        stopSessionMonitor();
+        forceLogout();
+      }
+    }, SESSION_CHECK_INTERVAL);
+
+    console.log(`[Auth] Session monitor started (every ${SESSION_CHECK_INTERVAL / 1000}s)`);
+  }
+
+  function stopSessionMonitor() {
+    if (sessionCheckTimer) {
+      clearInterval(sessionCheckTimer);
+      sessionCheckTimer = null;
+      console.log('[Auth] Session monitor stopped');
+    }
+  }
+
+  // ──────────────────────────────────────────────
+  // Session Management (localStorage + sessionStorage)
   // ──────────────────────────────────────────────
   const Session = {
     isLoggedIn() {
@@ -243,20 +286,18 @@
     },
 
     save(email, remember) {
-      const deviceId = getDeviceId();
       if (remember) {
         localStorage.setItem(SESSION_STATUS_KEY, 'authenticated');
         localStorage.setItem(SESSION_EMAIL_KEY, email);
         localStorage.setItem(REMEMBER_KEY, 'true');
-        localStorage.setItem(SESSION_ID_KEY, deviceId);
       } else {
         sessionStorage.setItem(SESSION_STATUS_KEY, 'authenticated');
         sessionStorage.setItem(SESSION_EMAIL_KEY, email);
-        sessionStorage.setItem(SESSION_ID_KEY, deviceId);
         localStorage.removeItem(SESSION_STATUS_KEY);
         localStorage.removeItem(SESSION_EMAIL_KEY);
         localStorage.removeItem(REMEMBER_KEY);
       }
+      // session_id is ALWAYS in localStorage so all tabs share it
     },
 
     getEmail() {
@@ -264,18 +305,18 @@
     },
 
     getSessionId() {
-      return localStorage.getItem(SESSION_ID_KEY) || sessionStorage.getItem(SESSION_ID_KEY) || '';
+      return localStorage.getItem(SESSION_ID_KEY) || '';
     },
 
     clear() {
       localStorage.removeItem(SESSION_STATUS_KEY);
       localStorage.removeItem(SESSION_EMAIL_KEY);
       localStorage.removeItem(REMEMBER_KEY);
-      localStorage.removeItem(SESSION_ID_KEY);
       sessionStorage.removeItem(SESSION_STATUS_KEY);
       sessionStorage.removeItem(SESSION_EMAIL_KEY);
-      sessionStorage.removeItem(SESSION_ID_KEY);
-      // NOTE: DEVICE_ID_KEY is NOT cleared — it's permanent per browser
+      // NOTE: SESSION_ID_KEY is NOT removed on logout.
+      // It stays permanently so the same device always has the same ID.
+      // This ensures multiple tabs share the same session_id.
     }
   };
 
@@ -432,7 +473,7 @@
 
       this.setLoading(true);
 
-      // Attempt login with single-device check
+      // Attempt login with strict single-device check
       const result = await attemptLogin(email);
 
       if (result.ok) {
@@ -446,7 +487,7 @@
         field.classList.add('auth-field--error');
         this.emailInput.focus();
       } else if (result.error === 'device_conflict') {
-        // 🚫 Another device is active
+        // 🚫 Another device is active — strict deny
         this.setLoading(false);
         this.showError(result.message);
       } else {
@@ -488,6 +529,7 @@
           this.overlay.remove();
           this.unlock();
           injectLogoutButton();
+          startSessionMonitor(); // begin periodic validation
         }, 600);
       }, 800);
     },
@@ -544,12 +586,15 @@
   async function handleLogout() {
     const email = Session.getEmail();
 
+    // Stop periodic session checks
+    stopSessionMonitor();
+
     // Release session in Supabase (set session_id to null)
     await releaseSession(email);
 
-    // Clear local session
+    // Clear local session data
     Session.clear();
-    console.log('[Auth] User logged out — session released');
+    console.log('[Auth] User logged out — session released, local data cleared');
 
     // Remove logout button
     const logoutSection = document.querySelector('.sidebar__logout-section');
@@ -567,6 +612,7 @@
   // Force-logout (session invalidated by another device)
   // ──────────────────────────────────────────────
   function forceLogout() {
+    stopSessionMonitor();
     Session.clear();
     console.warn('[Auth] Session invalidated — forcing logout');
 
@@ -579,11 +625,48 @@
     // Show the "kicked" message after modal renders
     setTimeout(() => {
       if (LoginGate.errorBox) {
-        LoginGate.showError('Your session was ended because another device logged in.');
+        LoginGate.showError('Your session was ended because another device logged in. Please re-login.');
       }
       if (LoginGate.emailInput) LoginGate.emailInput.focus();
     }, 700);
   }
+
+  // ──────────────────────────────────────────────
+  // Visibility-based session re-validation
+  // When user returns to the tab, immediately validate
+  // ──────────────────────────────────────────────
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!Session.isLoggedIn()) return;
+
+    const email = Session.getEmail();
+    if (!email) return;
+
+    console.log('[Auth] Tab became visible — re-validating session...');
+    const valid = await validateSession(email);
+
+    if (!valid) {
+      forceLogout();
+    }
+  });
+
+  // ──────────────────────────────────────────────
+  // Storage event listener — sync across tabs
+  // If another tab logs out (clears session), this tab
+  // should also recognize the logout immediately.
+  // ──────────────────────────────────────────────
+  window.addEventListener('storage', (e) => {
+    if (e.key === SESSION_STATUS_KEY && !e.newValue) {
+      // Session was cleared in another tab
+      if (Session.isLoggedIn()) return; // still logged in via sessionStorage
+      console.log('[Auth] Session cleared in another tab — showing login gate');
+      stopSessionMonitor();
+      const logoutSection = document.querySelector('.sidebar__logout-section');
+      if (logoutSection) logoutSection.remove();
+      LoginGate.lock();
+      LoginGate.create();
+    }
+  });
 
   // ──────────────────────────────────────────────
   // Initialize Auth Gate
@@ -598,6 +681,7 @@
       if (valid) {
         // ✅ Session valid on this device
         injectLogoutButton();
+        startSessionMonitor(); // begin periodic checks
         return;
       } else {
         // 🚫 Another device took over — force logout
