@@ -171,21 +171,42 @@
   /**
    * Release session_id in Supabase (on logout).
    * Sets session_id to NULL so another device can login.
+   * Retries up to 3 times with exponential backoff.
+   * Returns true if successful, false otherwise.
    */
   async function releaseSession(email) {
-    if (!email) return;
+    if (!email) {
+      console.warn('[Auth] releaseSession called without email');
+      return false;
+    }
 
     const url = `${SUPABASE_URL}/rest/v1/${AUTH_TABLE}?email=eq.${encodeURIComponent(email)}`;
-    const result = await supabaseRequest(url, {
-      method: 'PATCH',
-      body: JSON.stringify({ session_id: null }),
-    }, 1); // single attempt — don't block the user
+    const maxAttempts = 3;
 
-    if (result.ok) {
-      console.log('[Auth] Session released in DB (session_id set to NULL)');
-    } else {
-      console.warn('[Auth] Could not release session in DB (non-blocking)');
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.log(`[Auth] Releasing session attempt ${attempt}/${maxAttempts}...`);
+
+      const result = await supabaseRequest(url, {
+        method: 'PATCH',
+        body: JSON.stringify({ session_id: null }),
+      }, 1);
+
+      if (result.ok) {
+        console.log('[Auth] Session released in DB (session_id set to NULL)');
+        return true;
+      }
+
+      console.warn(`[Auth] Release attempt ${attempt} failed: ${result.message || 'unknown error'}`);
+
+      if (attempt < maxAttempts) {
+        const delay = AUTH_RETRY_DELAY * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+        console.log(`[Auth] Retrying release in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
     }
+
+    console.error('[Auth] All release attempts failed — session_id may remain in DB');
+    return false;
   }
 
   /**
@@ -588,12 +609,21 @@
     // Stop periodic session checks
     stopSessionMonitor();
 
-    // Release session in Supabase (set session_id to null)
-    await releaseSession(email);
+    // Disable the logout button to prevent double-clicks
+    const logoutBtn = document.getElementById('logoutBtn');
+    if (logoutBtn) {
+      logoutBtn.disabled = true;
+      logoutBtn.style.opacity = '0.5';
+      logoutBtn.style.pointerEvents = 'none';
+    }
 
-    // Clear local session data
+    // Release session in Supabase (set session_id to null)
+    const released = await releaseSession(email);
+
+    // ALWAYS clear local session data regardless of DB result
+    // This ensures the user is never stuck in a logged-in state locally
     Session.clear();
-    console.log('[Auth] User logged out — session released, local data cleared');
+    console.log('[Auth] User logged out — local data cleared');
 
     // Remove logout button
     const logoutSection = document.querySelector('.sidebar__logout-section');
@@ -602,7 +632,14 @@
     // Re-lock and show login
     LoginGate.lock();
     LoginGate.create();
+
     setTimeout(() => {
+      if (!released) {
+        // Warn user that DB cleanup failed — they may face issues on another device
+        LoginGate.showError(
+          'Logged out locally, but could not reach the server. If you have trouble logging in on another device, please try again later.'
+        );
+      }
       if (LoginGate.emailInput) LoginGate.emailInput.focus();
     }, 600);
   }
@@ -610,8 +647,15 @@
   // ──────────────────────────────────────────────
   // Force-logout (session invalidated by another device)
   // ──────────────────────────────────────────────
-  function forceLogout() {
+  async function forceLogout() {
+    const email = Session.getEmail();
     stopSessionMonitor();
+
+    // Attempt to release session in DB so no stale session_id blocks future logins
+    if (email) {
+      await releaseSession(email);
+    }
+
     Session.clear();
     console.warn('[Auth] Session invalidated — forcing logout');
 
